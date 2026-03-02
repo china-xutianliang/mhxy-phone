@@ -14,26 +14,22 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 视频采集驱动：一个实例绑定一块采集卡，在专属线程中持续抓帧。
- * <p>
- * 帧处理流水线（Step-1 仅实现 1→5）：
- * <ol>
- *   <li>FFmpegFrameGrabber 抓取原始帧</li>
- *   <li>ROI 裁剪（Step-2）</li>
- *   <li>旋转矫正（Step-3）</li>
- *   <li>输出虚拟画布（Mat + BufferedImage）</li>
- *   <li>通知所有 FrameListener</li>
- * </ol>
+ * 视频采集驱动：绑定一块采集卡，持续抓帧并完成 ROI 裁剪。
+ * 不强制设置采集分辨率，使用采集卡原生输出；
+ * 不做旋转和缩放，保留原始像素交给显示端处理。
  */
 public class VideoDriver implements Runnable {
 
     private static final Logger log = LoggerFactory.getLogger(VideoDriver.class);
+    private static final int ROI_WARMUP_FRAMES = 15;
 
     private final DeviceConfig config;
     private final List<FrameListener> listeners = new CopyOnWriteArrayList<>();
     private final Java2DFrameConverter converter = new Java2DFrameConverter();
 
     private volatile boolean running;
+    private volatile boolean startedSuccessfully;
+    private volatile String lastError;
     private volatile double currentFps;
     private Thread captureThread;
 
@@ -41,25 +37,13 @@ public class VideoDriver implements Runnable {
         this.config = config;
     }
 
-    public void addListener(FrameListener listener) {
-        listeners.add(listener);
-    }
-
-    public void removeListener(FrameListener listener) {
-        listeners.remove(listener);
-    }
-
-    public double getCurrentFps() {
-        return currentFps;
-    }
-
-    public boolean isRunning() {
-        return running;
-    }
-
-    public DeviceConfig getConfig() {
-        return config;
-    }
+    public void addListener(FrameListener listener)    { listeners.add(listener); }
+    public void removeListener(FrameListener listener) { listeners.remove(listener); }
+    public double getCurrentFps()                      { return currentFps; }
+    public boolean isRunning()                         { return running; }
+    public DeviceConfig getConfig()                    { return config; }
+    public boolean hasStartedSuccessfully()            { return startedSuccessfully; }
+    public String getLastError()                       { return lastError; }
 
     public void start() {
         if (running) return;
@@ -74,9 +58,7 @@ public class VideoDriver implements Runnable {
         running = false;
         if (captureThread != null) {
             captureThread.interrupt();
-            try {
-                captureThread.join(3000);
-            } catch (InterruptedException ignored) {
+            try { captureThread.join(3000); } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
             }
         }
@@ -88,9 +70,18 @@ public class VideoDriver implements Runnable {
         FFmpegFrameGrabber grabber = null;
         try {
             grabber = createGrabber();
+            log.info("正在打开采集设备: {} ...", config.getDeviceName());
             grabber.start();
-            log.info("采集卡已打开: {} ({}x{})",
-                    config.getDeviceName(), grabber.getImageWidth(), grabber.getImageHeight());
+
+            int rawW = grabber.getImageWidth();
+            int rawH = grabber.getImageHeight();
+            log.info("采集卡已打开: {} (原始 {}x{})", config.getDeviceName(), rawW, rawH);
+            startedSuccessfully = true;
+
+            Rectangle roi = resolveRoi();
+            boolean needCrop = (roi != null);
+            boolean roiResolved = (roi != null || !config.isAutoRoi());
+            int warmup = 0;
 
             AtomicInteger frameCount = new AtomicInteger();
             long fpsTimer = System.nanoTime();
@@ -99,12 +90,29 @@ public class VideoDriver implements Runnable {
                 Frame frame = grabber.grab();
                 if (frame == null || frame.image == null) continue;
 
-                BufferedImage image = converter.convert(frame);
-                if (image == null) continue;
+                BufferedImage raw = converter.convert(frame);
+                if (raw == null) continue;
 
-                BufferedImage copy = deepCopy(image);
+                if (!roiResolved) {
+                    warmup++;
+                    if (warmup >= ROI_WARMUP_FRAMES) {
+                        roi = FrameProcessor.detectRoi(raw);
+                        roiResolved = true;
+                        needCrop = (roi != null);
+                        if (roi != null) {
+                            log.info("[{}] 自动 ROI: x={} y={} {}x{}",
+                                    config.getDeviceName(), roi.x, roi.y, roi.width, roi.height);
+                        } else {
+                            log.info("[{}] 无需裁剪（手机内容填满采集画面）", config.getDeviceName());
+                        }
+                    }
+                }
+
+                BufferedImage processed = needCrop
+                        ? FrameProcessor.crop(raw, roi)
+                        : deepCopy(raw);
+
                 frameCount.incrementAndGet();
-
                 long now = System.nanoTime();
                 if (now - fpsTimer >= 1_000_000_000L) {
                     currentFps = frameCount.getAndSet(0) / ((now - fpsTimer) / 1.0e9);
@@ -113,16 +121,15 @@ public class VideoDriver implements Runnable {
 
                 for (FrameListener listener : listeners) {
                     try {
-                        listener.onFrame(copy, currentFps);
+                        listener.onFrame(processed, currentFps);
                     } catch (Exception e) {
                         log.warn("FrameListener 异常", e);
                     }
                 }
             }
         } catch (Exception e) {
-            if (running) {
-                log.error("采集线程异常: {}", config.getDeviceName(), e);
-            }
+            lastError = e.getMessage();
+            log.error("采集线程异常: {}", config.getDeviceName(), e);
         } finally {
             if (grabber != null) {
                 try { grabber.stop(); } catch (Exception ignored) {}
@@ -133,22 +140,28 @@ public class VideoDriver implements Runnable {
         }
     }
 
+    private Rectangle resolveRoi() {
+        if (config.hasManualRoi()) {
+            Rectangle r = new Rectangle(
+                    config.getRoiX(), config.getRoiY(),
+                    config.getRoiWidth(), config.getRoiHeight());
+            log.info("[{}] 使用手动 ROI: {}", config.getDeviceName(), r);
+            return r;
+        }
+        return null;
+    }
+
     private FFmpegFrameGrabber createGrabber() {
         FFmpegFrameGrabber g = new FFmpegFrameGrabber("video=" + config.getDeviceName());
         g.setFormat("dshow");
-        g.setImageWidth(config.getCaptureWidth());
-        g.setImageHeight(config.getCaptureHeight());
-        g.setOption("rtbufsize", "702000k");
-        g.setOption("fflags", "nobuffer");
-        g.setOption("flags", "low_delay");
-        g.setOption("probesize", "5000000");
+        g.setImageWidth(1920);
+        g.setImageHeight(1080);
+        g.setOption("rtbufsize", "50000k");
+        g.setOption("probesize", "3000000");
         g.setOption("analyzeduration", "1000000");
         return g;
     }
 
-    /**
-     * Frame 内部缓冲区会被下一帧覆盖，必须深拷贝后才能跨线程传递。
-     */
     private static BufferedImage deepCopy(BufferedImage source) {
         BufferedImage copy = new BufferedImage(
                 source.getWidth(), source.getHeight(), BufferedImage.TYPE_3BYTE_BGR);
